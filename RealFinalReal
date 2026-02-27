@@ -1,0 +1,201 @@
+Flight Deal Agent — Toronto (YYZ/YTZ) → Anywhere
+Uses Amadeus API to find cheap flights and sends email alerts.
+
+Setup:
+  pip install amadeus requests
+
+Environment variables (or fill in the config below):
+  AMADEUS_API_KEY
+  AMADEUS_API_SECRET
+  EMAIL_SENDER
+  EMAIL_PASSWORD   (Gmail App Password — not your regular password)
+  EMAIL_RECIPIENT
+"""
+
+import os
+import smtplib
+import logging
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from amadeus import Client, ResponseError
+
+# ─────────────────────────────────────────────
+# CONFIG — edit these or set as env variables
+# ─────────────────────────────────────────────
+AMADEUS_API_KEY     = os.getenv("AMADEUS_API_KEY", "FqRGKNHWjenVFCaFhcI6I8GbFityNtGC")
+AMADEUS_API_SECRET  = os.getenv("AMADEUS_API_SECRET", "fptIO3PD5ULSd0Mu")
+
+EMAIL_SENDER        = os.getenv("EMAIL_SENDER", "fehrstevekaleaidan@gmail.com")
+EMAIL_PASSWORD      = os.getenv("EMAIL_PASSWORD", "ZB3WkGPhzb0xFpu")  # Gmail App Password
+EMAIL_RECIPIENT     = os.getenv("EMAIL_RECIPIENT", "fehrstevekaleaidan@gmail.com")
+
+ORIGIN              = "YYZ"          # Toronto Pearson (use YTZ for Billy Bishop)
+MAX_PRICE           = 300            # CAD — only alert if price is below this
+CURRENCY            = "CAD"
+ADULTS              = 1
+MAX_RESULTS         = 10             # top N cheapest offers to check
+
+# How many days ahead to search (e.g. 7–60 days from today)
+SEARCH_DAYS_MIN     = 7
+SEARCH_DAYS_MAX     = 180
+
+# ─────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+
+def get_search_dates(min_days: int, max_days: int) -> list[str]:
+    """Return a sample of departure dates to search."""
+    today = datetime.today()
+    dates = []
+    # Search a few dates spread across the window
+    step = max(1, (max_days - min_days) // 6)
+    for offset in range(min_days, max_days, step):
+        dates.append((today + timedelta(days=offset)).strftime("%Y-%m-%d"))
+    return dates
+
+
+def fetch_deals(amadeus: Client, departure_date: str) -> list[dict]:
+    """Search for cheapest flights from Toronto on a given date."""
+    try:
+        response = amadeus.shopping.flight_offers_search.get(
+            originLocationCode=ORIGIN,
+            destinationLocationCode="MAD",  # Amadeus free tier requires a destination;
+            # see note below about the Inspiration Search endpoint
+            departureDate=departure_date,
+            adults=ADULTS,
+            currencyCode=CURRENCY,
+            max=MAX_RESULTS,
+        )
+        return response.data
+    except ResponseError as e:
+        log.error(f"Amadeus API error on {departure_date}: {e}")
+        return []
+
+
+def fetch_inspiration_deals(amadeus: Client) -> list[dict]:
+    """
+    Use the Flight Inspiration Search endpoint to find the cheapest
+    destinations from Toronto — no specific destination needed.
+    This is the best endpoint for 'deals to anywhere'.
+    """
+    deals = []
+    dates = get_search_dates(SEARCH_DAYS_MIN, SEARCH_DAYS_MAX)
+
+    for date in dates:
+        try:
+            response = amadeus.shopping.flight_destinations.get(
+                origin=ORIGIN,
+                departureDate=date,
+                oneWay=False,
+                duration="7,14",           # trip length 1–14 days
+                nonStop=False,
+                maxPrice=MAX_PRICE,
+                currency=CURRENCY,
+            )
+            for offer in response.data:
+                deals.append({
+                    "departure_date": date,
+                    "destination":    offer.get("destination"),
+                    "price":          float(offer.get("price", {}).get("total", 9999)),
+                    "currency":       CURRENCY,
+                    "links":          offer.get("links", {}),
+                })
+        except ResponseError as e:
+            log.warning(f"Inspiration search error for {date}: {e}")
+
+    # Sort by price
+    deals.sort(key=lambda x: x["price"])
+    return deals
+
+
+def format_email(deals: list[dict]) -> tuple[str, str]:
+    """Return (subject, html_body) for the alert email."""
+    subject = f"✈️ Flight Deals from Toronto — {len(deals)} deal(s) found under {CURRENCY} {MAX_PRICE}"
+
+    rows = ""
+    for d in deals:
+        booking_link = d.get("links", {}).get("flightDates") or d.get("links", {}).get("flightOffers", "")
+        rows += f"""
+        <tr>
+          <td style="padding:8px;border-bottom:1px solid #eee;">{d['departure_date']}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;">{d['destination']}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;font-weight:bold;color:#2a7ae2;">
+            {d['currency']} {d['price']:.0f}
+          </td>
+          <td style="padding:8px;border-bottom:1px solid #eee;">
+            {'<a href="' + booking_link + '">Book →</a>' if booking_link else '—'}
+          </td>
+        </tr>
+        """
+
+    html = f"""
+    <html><body style="font-family:Arial,sans-serif;color:#333;">
+      <h2>✈️ Flight Deals from Toronto ({ORIGIN})</h2>
+      <p>Found <strong>{len(deals)}</strong> deal(s) under <strong>{CURRENCY} {MAX_PRICE}</strong>
+         — checked {datetime.now().strftime('%Y-%m-%d %H:%M')}.</p>
+      <table style="border-collapse:collapse;width:100%;max-width:600px;">
+        <thead>
+          <tr style="background:#f5f5f5;">
+            <th style="padding:8px;text-align:left;">Departure</th>
+            <th style="padding:8px;text-align:left;">Destination</th>
+            <th style="padding:8px;text-align:left;">Price</th>
+            <th style="padding:8px;text-align:left;">Link</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <p style="color:#888;font-size:12px;">
+        Prices are indicative. Final price confirmed at booking.
+      </p>
+    </body></html>
+    """
+    return subject, html
+
+
+def send_email(subject: str, html_body: str):
+    """Send an HTML email via Gmail SMTP."""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = EMAIL_SENDER
+    msg["To"]      = EMAIL_RECIPIENT
+    msg.attach(MIMEText(html_body, "html"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
+    log.info(f"Email sent to {EMAIL_RECIPIENT}")
+
+
+def run_agent():
+    log.info("Flight deal agent starting...")
+
+    amadeus = Client(
+        client_id=AMADEUS_API_KEY,
+        client_secret=AMADEUS_API_SECRET,
+    )
+
+    deals = fetch_inspiration_deals(amadeus)
+
+    if not deals:
+        log.info(f"No deals found under {CURRENCY} {MAX_PRICE}. No email sent.")
+        return
+
+    log.info(f"Found {len(deals)} deal(s). Sending email...")
+    subject, html = format_email(deals)
+    send_email(subject, html)
+    log.info("Done.")
+
+    # Optional: print deals to console
+    print(f"\n{'='*50}")
+    print(f"Deals found ({len(deals)}):")
+    for d in deals:
+        print(f"  {d['departure_date']}  →  {d['destination']}  —  {d['currency']} {d['price']:.0f}")
+    print('='*50)
+
+# Runs every morning at 8am
+0 8 * * * /usr/bin/python3 /path/to/flight_agent.py
+
+if __name__ == "__main__":
+    run_agent()
